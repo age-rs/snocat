@@ -34,6 +34,12 @@ impl QuinnListenEndpoint {
     quinn_config: quinn::ServerConfig,
   ) -> Result<Self, std::io::Error> {
     let endpoint = quinn::Endpoint::server(quinn_config, bind_addr)?;
+    if crate::quic_logging::is_enabled() {
+      tracing::info!(
+        bind_addr = %bind_addr,
+        "QUIC listen endpoint bound successfully"
+      );
+    }
     Ok(Self {
       bind_addr,
       endpoint: Box::pin(endpoint),
@@ -63,6 +69,12 @@ where
       if self.accepting.is_some() {
         self.accepting = None;
       }
+      if crate::quic_logging::is_enabled() {
+        tracing::debug!(
+          bind_addr = %self.bind_addr,
+          "QUIC listen endpoint: already terminated, rejecting poll"
+        );
+      }
       return Poll::Ready(None);
     }
 
@@ -76,6 +88,12 @@ where
     if let Some(connecting) = futures::ready!(Future::poll(accepting.as_mut(), cx)) {
       drop(accepting);
       self.accepting = None;
+      if crate::quic_logging::is_enabled() {
+        tracing::debug!(
+          bind_addr = %self.bind_addr,
+          "QUIC listen endpoint: new incoming connection handshake initiated"
+        );
+      }
       // Here is where we'd do the check for stream subtype if we want to split on ALPN,
       // which is stored in the [Connecting::handshake_data] which is the active Session.
       // (https://docs.rs/quinn/0.9.3/quinn/struct.Connecting.html#method.handshake_data)
@@ -83,6 +101,13 @@ where
     } else {
       self.accepting = None;
       self.is_terminated = true;
+      if crate::quic_logging::is_enabled() {
+        tracing::warn!(
+          bind_addr = %self.bind_addr,
+          "QUIC listen endpoint terminated: endpoint accept returned None \
+           (socket may have been closed or encountered an unrecoverable error)"
+        );
+      }
       Poll::Ready(None)
     }
   }
