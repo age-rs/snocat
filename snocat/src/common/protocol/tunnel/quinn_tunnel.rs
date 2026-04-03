@@ -389,7 +389,7 @@ impl TunnelUplink for QuinnTunnel {
               ),
               TunnelError::TransportError => tracing::error!(
                 tunnel_id = ?tunnel_id,
-                "QUIC outgoing stream open failed: transport error (protocol violation or version mismatch)"
+                "QUIC outgoing stream open failed: transport error (e.g., protocol violation, stateless reset, version mismatch, or other transport-level failure)"
               ),
               TunnelError::LocallyClosed => tracing::debug!(
                 tunnel_id = ?tunnel_id,
