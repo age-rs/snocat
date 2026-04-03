@@ -154,7 +154,7 @@ impl QuinnTunnel {
             ),
             TunnelError::TransportError => tracing::error!(
               tunnel_id = ?tunnel_id,
-              "QUIC incoming stream acceptance failed: transport error (protocol violation or version mismatch)"
+              "QUIC incoming stream acceptance failed: transport error (e.g., protocol violation, version mismatch, stateless reset, or other transport-level failure)"
             ),
             TunnelError::LocallyClosed => tracing::debug!(
               tunnel_id = ?tunnel_id,
