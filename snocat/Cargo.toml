@@ -31,6 +31,7 @@ tokio = { version = "1.25", features=["net", "io-util", "signal", "sync", "time"
 tokio-stream = { version = "0.1", features=["net", "io-util", "sync"] }
 tokio-util = { version = "0.7", features=["default", "io", "time"] }
 uuid = { version = "1.3", features=["v4", "v5", "serde"] }
+socket2 = "0.5"
 
 [dev-dependencies]
 mockall = { version = "0.11", features=["nightly"] }
