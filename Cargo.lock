@@ -1165,6 +1165,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "socket2 0.5.4",
  "thiserror",
  "tokio",
  "tokio-stream",
