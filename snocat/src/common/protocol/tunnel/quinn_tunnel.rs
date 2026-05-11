@@ -448,7 +448,7 @@ impl From<quinn::ConnectionError> for TunnelError {
         if logging {
           tracing::warn!(
             error_code = %e.code,
-            reason = %e.reason,
+            reason = %String::from_utf8_lossy(&e.reason),
             "QUIC connection dropped: transport error - {}",
             e
           );
