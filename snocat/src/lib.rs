@@ -24,6 +24,7 @@
 
 pub mod common;
 pub mod ext;
+pub mod quic_logging;
 pub mod util;
 
 pub mod client;

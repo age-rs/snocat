@@ -114,7 +114,23 @@ pub async fn server_main(config: self::ServerArgs) -> Result<()> {
   let quinn_config = build_quinn_config(&config)?;
   let endpoint = QuinnListenEndpoint::bind(config.quinn_bind_addr, quinn_config)?.filter_map(
     |(connecting, side)| {
-      connecting.map(move |res| res.ok().map(move |connection| (connection, side)))
+      connecting.map(move |res| match res {
+        Ok(connection) => {
+          tracing::info!(
+            remote_addr = %connection.remote_address(),
+            stable_id = connection.stable_id(),
+            "QUIC handshake completed: new connection established"
+          );
+          Some((connection, side))
+        }
+        Err(e) => {
+          tracing::warn!(
+            error = %e,
+            "QUIC handshake failed: incoming connection could not be established"
+          );
+          None
+        }
+      })
     },
   );
 

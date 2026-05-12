@@ -210,6 +210,11 @@ pub async fn client_main(config: ClientArgs) -> Result<()> {
   };
 
   {
+    tracing::info!(
+      driver_host = %config.driver_host,
+      driver_san = %config.driver_san,
+      "QUIC client: initiating connection to server"
+    );
     let connection = endpoint
       .connect_with(quinn_config, config.driver_host, &config.driver_san)
       .context("Connecting to server")?

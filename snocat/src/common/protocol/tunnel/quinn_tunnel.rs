@@ -69,6 +69,15 @@ impl QuinnTunnel {
     connection: quinn::Connection,
     side: TunnelSide,
   ) -> QuinnTunnel {
+    if crate::quic_logging::is_enabled() {
+      tracing::info!(
+        tunnel_id = ?id,
+        remote_addr = %connection.remote_address(),
+        side = ?side,
+        stable_id = connection.stable_id(),
+        "QUIC tunnel created: new connection established"
+      );
+    }
     let overall_cancellation: Arc<Dropkick<CancellationToken>> =
       Arc::new(CancellationToken::new().into());
     // Single-stream cancellations are derived from the full-cancellation token,
@@ -127,7 +136,32 @@ impl QuinnTunnel {
     .inspect_err({
       let incoming_cancellation = CancellationToken::clone(&incoming_cancellation);
       let close_reason_store = Arc::clone(&close_reason);
-      move |_tunnel_error| {
+      let tunnel_id = id;
+      move |tunnel_error| {
+        if crate::quic_logging::is_enabled() {
+          match tunnel_error {
+            TunnelError::ConnectionClosed => tracing::warn!(
+              tunnel_id = ?tunnel_id,
+              "QUIC incoming stream acceptance failed: connection closed by peer"
+            ),
+            TunnelError::ApplicationClosed => tracing::warn!(
+              tunnel_id = ?tunnel_id,
+              "QUIC incoming stream acceptance failed: application closed the connection"
+            ),
+            TunnelError::TimedOut => tracing::warn!(
+              tunnel_id = ?tunnel_id,
+              "QUIC incoming stream acceptance failed: connection idle timeout expired"
+            ),
+            TunnelError::TransportError => tracing::error!(
+              tunnel_id = ?tunnel_id,
+              "QUIC incoming stream acceptance failed: transport error (e.g., protocol violation, version mismatch, stateless reset, or other transport-level failure)"
+            ),
+            TunnelError::LocallyClosed => tracing::debug!(
+              tunnel_id = ?tunnel_id,
+              "QUIC incoming stream acceptance stopped: connection closed locally"
+            ),
+          }
+        }
         let close_reason = TunnelCloseReason::Error(TunnelError::ConnectionClosed);
         {
           let close_reason_store = &close_reason_store;
@@ -164,6 +198,14 @@ impl TunnelControl for QuinnTunnel {
     &'a self,
     reason: TunnelCloseReason,
   ) -> BoxFuture<'a, Result<Arc<TunnelCloseReason>, Arc<TunnelCloseReason>>> {
+    if crate::quic_logging::is_enabled() {
+      tracing::info!(
+        tunnel_id = ?self.id,
+        remote_addr = %self.connection.remote_address(),
+        reason = %reason,
+        "QUIC tunnel closing"
+      );
+    }
     // Set the close reason only if it is currently [TunnelCloseReason::Unspecified]
     let prev = self.close_reason.rcu({
       let reason = Arc::new(reason);
@@ -329,7 +371,32 @@ impl TunnelUplink for QuinnTunnel {
         // until the [Tunnel], its downlink, and all its uplinks are dropped.
         let close_outgoing = self.outgoing_closed.clone();
         let close_reason_store = Arc::clone(&self.close_reason);
+        let tunnel_id = self.id;
         move |tunnel_error: &TunnelError| {
+          if crate::quic_logging::is_enabled() {
+            match tunnel_error {
+              TunnelError::ConnectionClosed => tracing::warn!(
+                tunnel_id = ?tunnel_id,
+                "QUIC outgoing stream open failed: connection closed by peer"
+              ),
+              TunnelError::ApplicationClosed => tracing::warn!(
+                tunnel_id = ?tunnel_id,
+                "QUIC outgoing stream open failed: application closed the connection"
+              ),
+              TunnelError::TimedOut => tracing::warn!(
+                tunnel_id = ?tunnel_id,
+                "QUIC outgoing stream open failed: connection idle timeout expired"
+              ),
+              TunnelError::TransportError => tracing::error!(
+                tunnel_id = ?tunnel_id,
+                "QUIC outgoing stream open failed: transport error (e.g., protocol violation, stateless reset, version mismatch, or other transport-level failure)"
+              ),
+              TunnelError::LocallyClosed => tracing::debug!(
+                tunnel_id = ?tunnel_id,
+                "QUIC outgoing stream open stopped: connection closed locally"
+              ),
+            }
+          }
           let close_reason = TunnelCloseReason::Error(tunnel_error.clone());
           {
             let close_reason_store = &close_reason_store;
@@ -367,14 +434,71 @@ impl Tunnel for QuinnTunnel {
 
 impl From<quinn::ConnectionError> for TunnelError {
   fn from(connection_error: quinn::ConnectionError) -> Self {
+    let logging = crate::quic_logging::is_enabled();
     match connection_error {
-      quinn::ConnectionError::VersionMismatch => Self::TransportError,
-      quinn::ConnectionError::TransportError(_) => Self::TransportError,
-      quinn::ConnectionError::ConnectionClosed(_) => Self::ConnectionClosed,
-      quinn::ConnectionError::ApplicationClosed(_) => Self::ApplicationClosed,
-      quinn::ConnectionError::Reset => Self::TransportError,
-      quinn::ConnectionError::TimedOut => Self::TimedOut,
-      quinn::ConnectionError::LocallyClosed => Self::LocallyClosed,
+      quinn::ConnectionError::VersionMismatch => {
+        if logging {
+          tracing::warn!(
+            "QUIC connection dropped: version mismatch between client and server QUIC implementations"
+          );
+        }
+        Self::TransportError
+      }
+      quinn::ConnectionError::TransportError(ref e) => {
+        if logging {
+          tracing::warn!(
+            error_code = %e.code,
+            reason = %String::from_utf8_lossy(&e.reason),
+            "QUIC connection dropped: transport error - {}",
+            e
+          );
+        }
+        Self::TransportError
+      }
+      quinn::ConnectionError::ConnectionClosed(ref frame) => {
+        if logging {
+          tracing::info!(
+            error_code = %frame.error_code,
+            reason = %String::from_utf8_lossy(&frame.reason),
+            "QUIC connection closed by peer"
+          );
+        }
+        Self::ConnectionClosed
+      }
+      quinn::ConnectionError::ApplicationClosed(ref frame) => {
+        if logging {
+          tracing::info!(
+            error_code = %frame.error_code,
+            reason = %String::from_utf8_lossy(&frame.reason),
+            "QUIC connection closed by application"
+          );
+        }
+        Self::ApplicationClosed
+      }
+      quinn::ConnectionError::Reset => {
+        if logging {
+          tracing::warn!(
+            "QUIC connection dropped: stateless reset received (peer may have restarted or lost state)"
+          );
+        }
+        Self::TransportError
+      }
+      quinn::ConnectionError::TimedOut => {
+        if logging {
+          tracing::warn!(
+            "QUIC connection dropped: idle timeout expired (no response from peer within timeout period)"
+          );
+        }
+        Self::TimedOut
+      }
+      quinn::ConnectionError::LocallyClosed => {
+        if logging {
+          tracing::debug!(
+            "QUIC connection closed locally"
+          );
+        }
+        Self::LocallyClosed
+      }
     }
   }
 }
