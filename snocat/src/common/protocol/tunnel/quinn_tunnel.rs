@@ -31,6 +31,7 @@ pub struct QuinnTunnel {
   connection: quinn::Connection,
   side: TunnelSide,
   incoming: Arc<tokio::sync::Mutex<TunnelIncoming>>,
+  created_at: std::time::Instant,
 
   closed: Arc<Dropkick<CancellationToken>>,
   incoming_closed: Arc<Dropkick<CancellationToken>>,
@@ -69,6 +70,7 @@ impl QuinnTunnel {
     connection: quinn::Connection,
     side: TunnelSide,
   ) -> QuinnTunnel {
+    let created_at = std::time::Instant::now();
     if crate::quic_logging::is_enabled() {
       tracing::info!(
         tunnel_id = ?id,
@@ -189,6 +191,7 @@ impl QuinnTunnel {
       outgoing_closed: Arc::new(overall_cancellation.child_token().into()),
       incoming_closed: incoming_cancellation,
       closed: overall_cancellation,
+      created_at,
     }
   }
 }
@@ -203,6 +206,7 @@ impl TunnelControl for QuinnTunnel {
         tunnel_id = ?self.id,
         remote_addr = %self.connection.remote_address(),
         reason = %reason,
+        duration_ms = self.created_at.elapsed().as_millis() as u64,
         "QUIC tunnel closing"
       );
     }
@@ -257,6 +261,10 @@ impl TunnelControl for QuinnTunnel {
 }
 
 impl TunnelMonitoring for QuinnTunnel {
+  fn created_at(&self) -> std::time::Instant {
+    self.created_at
+  }
+
   fn is_closed(&self) -> bool {
     self.closed.is_cancelled()
   }
