@@ -4,7 +4,7 @@ use crate::ext::future::TryFutureExtExt;
 #[warn(unused_imports)]
 use crate::{
   common::protocol::tunnel::{
-    Tunnel, TunnelAddressInfo, TunnelError, TunnelIncomingType, TunnelName, TunnelSide,
+    Tunnel, TunnelAddressInfo, TunnelError, TunnelId, TunnelIncomingType, TunnelName, TunnelSide,
   },
   util::{cancellation::CancellationListener, tunnel_stream::TunnelStream},
 };
@@ -18,6 +18,7 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct TunnelInfo {
+  pub tunnel_id: TunnelId,
   pub side: TunnelSide,
   pub addr: TunnelAddressInfo,
 }
@@ -314,6 +315,7 @@ where
 {
   use tracing::{debug, debug_span, warn, Instrument};
   let tunnel_info = TunnelInfo {
+    tunnel_id: tunnel.id().clone(),
     side: tunnel.side(),
     addr: tunnel.addr(),
   };

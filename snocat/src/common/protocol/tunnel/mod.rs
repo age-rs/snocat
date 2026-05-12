@@ -174,6 +174,16 @@ impl TunnelCloseReason {
 }
 
 pub trait TunnelMonitoring {
+  /// The instant at which this tunnel was created.
+  ///
+  /// Used to compute tunnel lifetime duration at close time.
+  /// The default returns `Instant::now()`, which will produce
+  /// inaccurate durations. Concrete tunnel implementations should
+  /// override this to return the actual creation instant.
+  fn created_at(&self) -> std::time::Instant {
+    std::time::Instant::now()
+  }
+
   /// If the tunnel is currently closed on uplink and downlink
   fn is_closed(&self) -> bool;
 
