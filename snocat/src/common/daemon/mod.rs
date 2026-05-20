@@ -1070,7 +1070,16 @@ where
   {
     match link {
       tunnel::TunnelIncomingType::BiStream(link) => {
-        Self::handle_incoming_request_bistream(tunnel, link, negotiator, shutdown).await
+        let tid = *tunnel.id();
+        async {
+          tracing::debug!(
+            tunnel_id = ?tid,
+            "Tunnel stream processing started"
+          );
+          Self::handle_incoming_request_bistream(tunnel, link, negotiator, shutdown).await
+        }
+          .instrument(tracing::info_span!("tunnel_stream", tunnel_id = ?tid))
+          .await
       }
     }
   }

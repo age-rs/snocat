@@ -1,13 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license OR Apache 2.0
 #![deny(unused_imports, dead_code)]
-use std::sync::Arc;
+use std::{
+  pin::Pin,
+  sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+  },
+  task::{Context, Poll},
+};
 
 use arc_swap::ArcSwap;
 use futures::{
   future::{self, BoxFuture},
   FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 };
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_util::sync::CancellationToken;
@@ -26,12 +34,54 @@ use super::{
   TunnelMonitoringPerChannel, TunnelName, WithTunnelId,
 };
 
+/// Decrements the active stream counter and logs when a QUIC stream is dropped.
+struct StreamDropGuard {
+  counter: Arc<AtomicUsize>,
+  tunnel_id: TunnelId,
+  opened_at: std::time::Instant,
+  tunnel_created_at: std::time::Instant,
+}
+
+impl Drop for StreamDropGuard {
+  fn drop(&mut self) {
+    let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "StreamDropGuard dropped with zero active stream count");
+    let remaining = prev.saturating_sub(1);
+    if crate::quic_logging::is_enabled() {
+      tracing::debug!(
+        tunnel_id = ?self.tunnel_id,
+        active_streams = remaining,
+        stream_duration_ms = self.opened_at.elapsed().as_millis() as u64,
+        tunnel_duration_ms = self.tunnel_created_at.elapsed().as_millis() as u64,
+        "QUIC stream closed on tunnel"
+      );
+    }
+  }
+}
+
+/// Wraps an `AsyncRead` half with a [`StreamDropGuard`] that fires on drop.
+struct GuardedAsyncRead {
+  inner: Box<dyn AsyncRead + Send + Sync + Unpin + 'static>,
+  _guard: StreamDropGuard,
+}
+
+impl AsyncRead for GuardedAsyncRead {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+  ) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut *self.inner).poll_read(cx, buf)
+  }
+}
+
 pub struct QuinnTunnel {
   id: TunnelId,
   connection: quinn::Connection,
   side: TunnelSide,
   incoming: Arc<tokio::sync::Mutex<TunnelIncoming>>,
   created_at: std::time::Instant,
+  active_stream_count: Arc<AtomicUsize>,
 
   closed: Arc<Dropkick<CancellationToken>>,
   incoming_closed: Arc<Dropkick<CancellationToken>>,
@@ -46,6 +96,7 @@ impl std::fmt::Debug for QuinnTunnel {
     f.debug_struct("QuinnTunnel")
       .field("id", &self.id)
       .field("side", &self.side)
+      .field("active_streams", &self.active_stream_count.load(Ordering::Relaxed))
       .field("closed", &self.incoming_closed)
       .field("incoming_closed", &self.incoming_closed)
       .field("outgoing_closed", &self.outgoing_closed)
@@ -63,6 +114,11 @@ impl QuinnTunnel {
     Arc<tokio::sync::Mutex<TunnelIncoming>>,
   ) {
     (self.id, self.connection, self.side, self.incoming)
+  }
+
+  /// Returns the current number of active QUIC streams on this tunnel.
+  pub fn active_stream_count(&self) -> usize {
+    self.active_stream_count.load(Ordering::Relaxed)
   }
 
   pub fn from_quinn_connection(
@@ -109,6 +165,7 @@ impl QuinnTunnel {
       });
     }
     let close_reason = Arc::new(ArcSwap::new(Arc::new(TunnelCloseReason::Unspecified)));
+    let active_stream_count = Arc::new(AtomicUsize::new(0));
     let stream_tunnels = futures::stream::try_unfold((), {
       let connection = connection.clone();
       move |()| {
@@ -116,9 +173,34 @@ impl QuinnTunnel {
         async move { connection.accept_bi().await }.map_ok(move |res| Some((res, ())))
       }
     })
-    .map_ok(|(send, recv)| {
-      // TODO: make the incoming streams exit when close() is called (make a failing test first)
-      TunnelIncomingType::BiStream(WrappedStream::Boxed(Box::new(recv), Box::new(send)))
+    .map_ok({
+      let counter = active_stream_count.clone();
+      move |(send, recv)| {
+        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if crate::quic_logging::is_enabled() {
+          tracing::debug!(
+            tunnel_id = ?id,
+            active_streams = count,
+            direction = "incoming",
+            tunnel_duration_ms = created_at.elapsed().as_millis() as u64,
+            "QUIC stream accepted on tunnel"
+          );
+        }
+        let guard = StreamDropGuard {
+          counter: counter.clone(),
+          tunnel_id: id,
+          opened_at: std::time::Instant::now(),
+          tunnel_created_at: created_at,
+        };
+        // TODO: make the incoming streams exit when close() is called (make a failing test first)
+        TunnelIncomingType::BiStream(WrappedStream::Boxed(
+          Box::new(GuardedAsyncRead {
+            inner: Box::new(recv),
+            _guard: guard,
+          }),
+          Box::new(send),
+        ))
+      }
     })
     .map_err(Into::into)
     // Only take new streams until incoming is cancelled
@@ -138,28 +220,35 @@ impl QuinnTunnel {
     .inspect_err({
       let incoming_cancellation = CancellationToken::clone(&incoming_cancellation);
       let close_reason_store = Arc::clone(&close_reason);
+      let active_streams = active_stream_count.clone();
       let tunnel_id = id;
       move |tunnel_error| {
         if crate::quic_logging::is_enabled() {
+          let active = active_streams.load(Ordering::Relaxed);
           match tunnel_error {
             TunnelError::ConnectionClosed => tracing::warn!(
               tunnel_id = ?tunnel_id,
+              active_streams = active,
               "QUIC incoming stream acceptance failed: connection closed by peer"
             ),
             TunnelError::ApplicationClosed => tracing::warn!(
               tunnel_id = ?tunnel_id,
+              active_streams = active,
               "QUIC incoming stream acceptance failed: application closed the connection"
             ),
             TunnelError::TimedOut => tracing::warn!(
               tunnel_id = ?tunnel_id,
+              active_streams = active,
               "QUIC incoming stream acceptance failed: connection idle timeout expired"
             ),
             TunnelError::TransportError => tracing::error!(
               tunnel_id = ?tunnel_id,
+              active_streams = active,
               "QUIC incoming stream acceptance failed: transport error (e.g., protocol violation, version mismatch, stateless reset, or other transport-level failure)"
             ),
             TunnelError::LocallyClosed => tracing::debug!(
               tunnel_id = ?tunnel_id,
+              active_streams = active,
               "QUIC incoming stream acceptance stopped: connection closed locally"
             ),
           }
@@ -186,6 +275,7 @@ impl QuinnTunnel {
         side,
       })),
       close_reason,
+      active_stream_count,
       authenticated: Default::default(),
       authenticated_notifier: Arc::new(watch::channel(None).0),
       outgoing_closed: Arc::new(overall_cancellation.child_token().into()),
@@ -207,6 +297,7 @@ impl TunnelControl for QuinnTunnel {
         remote_addr = %self.connection.remote_address(),
         reason = %reason,
         duration_ms = self.created_at.elapsed().as_millis() as u64,
+        active_streams = self.active_stream_count.load(Ordering::Relaxed),
         "QUIC tunnel closing"
       );
     }
@@ -369,9 +460,36 @@ impl TunnelUplink for QuinnTunnel {
     }
     // TODO: make individual sub-streams exit when close() is called, using `quinn::Connection::close()`
     let connection = self.connection.clone();
+    let counter = self.active_stream_count.clone();
+    let tunnel_id = self.id;
+    let tunnel_created_at = self.created_at;
     async move { connection.open_bi().await }
-      .map(|result| match result {
-        Ok((send, recv)) => Ok(WrappedStream::Boxed(Box::new(recv), Box::new(send))),
+      .map(move |result| match result {
+        Ok((send, recv)) => {
+          let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+          if crate::quic_logging::is_enabled() {
+            tracing::debug!(
+              tunnel_id = ?tunnel_id,
+              active_streams = count,
+              direction = "outgoing",
+              tunnel_duration_ms = tunnel_created_at.elapsed().as_millis() as u64,
+              "QUIC stream opened on tunnel"
+            );
+          }
+          let guard = StreamDropGuard {
+            counter: counter.clone(),
+            tunnel_id,
+            opened_at: std::time::Instant::now(),
+            tunnel_created_at,
+          };
+          Ok(WrappedStream::Boxed(
+            Box::new(GuardedAsyncRead {
+              inner: Box::new(recv),
+              _guard: guard,
+            }),
+            Box::new(send),
+          ))
+        }
         Err(e) => Err(e.into()),
       })
       .inspect_err({
@@ -379,28 +497,35 @@ impl TunnelUplink for QuinnTunnel {
         // until the [Tunnel], its downlink, and all its uplinks are dropped.
         let close_outgoing = self.outgoing_closed.clone();
         let close_reason_store = Arc::clone(&self.close_reason);
+        let active_streams = self.active_stream_count.clone();
         let tunnel_id = self.id;
         move |tunnel_error: &TunnelError| {
           if crate::quic_logging::is_enabled() {
+            let active = active_streams.load(Ordering::Relaxed);
             match tunnel_error {
               TunnelError::ConnectionClosed => tracing::warn!(
                 tunnel_id = ?tunnel_id,
+                active_streams = active,
                 "QUIC outgoing stream open failed: connection closed by peer"
               ),
               TunnelError::ApplicationClosed => tracing::warn!(
                 tunnel_id = ?tunnel_id,
+                active_streams = active,
                 "QUIC outgoing stream open failed: application closed the connection"
               ),
               TunnelError::TimedOut => tracing::warn!(
                 tunnel_id = ?tunnel_id,
+                active_streams = active,
                 "QUIC outgoing stream open failed: connection idle timeout expired"
               ),
               TunnelError::TransportError => tracing::error!(
                 tunnel_id = ?tunnel_id,
+                active_streams = active,
                 "QUIC outgoing stream open failed: transport error (e.g., protocol violation, stateless reset, version mismatch, or other transport-level failure)"
               ),
               TunnelError::LocallyClosed => tracing::debug!(
                 tunnel_id = ?tunnel_id,
+                active_streams = active,
                 "QUIC outgoing stream open stopped: connection closed locally"
               ),
             }
