@@ -54,6 +54,16 @@ impl QuinnListenEndpoint {
     self.bind_addr
   }
 
+  /// Wrap an already-created quinn endpoint.
+  pub fn from_endpoint(bind_addr: SocketAddr, endpoint: quinn::Endpoint) -> Self {
+    Self {
+      bind_addr,
+      endpoint: Box::pin(endpoint),
+      accepting: None,
+      is_terminated: false,
+    }
+  }
+
   pub fn bind_with_buffer_sizes(
       bind_addr: SocketAddr,
       quinn_config: quinn::ServerConfig,
