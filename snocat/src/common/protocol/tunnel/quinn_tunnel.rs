@@ -301,6 +301,13 @@ impl TunnelControl for QuinnTunnel {
         "QUIC tunnel closing"
       );
     }
+
+    // Emit CONNECTION_CLOSE frame on the wire so the peer learns immediately
+    // rather than waiting for its own idle timeout to fire.
+    // Use a generic error code and empty reason to avoid leaking information
+    // (e.g., authentication rejection details) outside SSL-wrapped streams.
+    self.connection.close(quinn::VarInt::from_u32(0), b"");
+
     // Set the close reason only if it is currently [TunnelCloseReason::Unspecified]
     let prev = self.close_reason.rcu({
       let reason = Arc::new(reason);
